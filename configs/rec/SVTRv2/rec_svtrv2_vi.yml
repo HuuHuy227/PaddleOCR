@@ -1,0 +1,174 @@
+Global:
+  use_gpu: true
+  epoch_num: 20 # Giữ nguyên số epoch ban đầu, có thể tăng sau
+  log_smooth_window: 20
+  print_batch_step: 100
+  # === PATH & CHECKPOINT SAVING ===
+  save_model_dir: /kaggle/working/output/rec_svtrv2_vi # Lưu vào /kaggle/working
+  save_epoch_step: 5 # Lưu checkpoint sau mỗi 10 epoch để tiết kiệm dung lượng
+  # === END PATH & CHECKPOINT SAVING ===
+  eval_batch_step: [0, 2000] # Tần suất đánh giá
+  cal_metric_during_train: False
+  pretrained_model: null
+  checkpoints: null
+  save_inference_dir: null
+  use_visualdl: false # Đặt true nếu muốn và đã cài visualdl
+  # === PATHS ===
+  character_dict_path: /kaggle/input/ocr-data/data/vi_dict.txt # Đường dẫn dữ liệu Kaggle
+  # === END PATHS ===
+  max_text_length: &max_text_length 50 # Giữ nguyên từ lần trước
+  use_space_char: true
+  # === MULTI-GPU ===
+  distributed: true # Bật chế độ distributed cho multi-gpu
+  # === END MULTI-GPU ===
+  save_res_path: /kaggle/working/output/rec_svtrv2_vi/predicts_svrtv2.txt
+  d2s_train_image_shape: [3, 48, 768] # Giữ nguyên tham chiếu
+
+Optimizer:
+  name: AdamW
+  beta1: 0.9
+  beta2: 0.999
+  epsilon: 1.e-8
+  weight_decay: 0.05
+  no_weight_decay_name: norm
+  one_dim_param_no_weight_decay: True
+  lr:
+    name: Cosine
+    # === LR FOR 2xT4 16GB ===
+    # Base LR: 0.001 for total_bs = 1536
+    # GPU: 2 x T4 16GB -> Ít bộ nhớ hơn V100
+    # Thử bs_per_card = 32 (cần theo dõi memory)
+    # New Total_bs = 2 * 32 = 64
+    # New LR = 0.001 * (64 / 1536) = 0.001 / 24 ≈ 0.00004167
+    learning_rate: 0.000042
+    # === END LR ===
+    warmup_epoch: 5
+
+Architecture:
+  model_type: rec
+  algorithm: SVTR_HGNet
+  Transform: null
+  Backbone:
+    name: SVTRv2
+    # Giữ nguyên cấu trúc SVTRv2 như config mẫu
+    use_pos_embed: False
+    dims: [128, 256, 384]
+    depths: [6, 6, 6]
+    num_heads: [4, 8, 12]
+    mixer: [['Conv','Conv','Conv','Conv','Conv','Conv'],['Conv','Conv','Global','Global','Global','Global'],['Global','Global','Global','Global','Global','Global']]
+    local_k: [[5, 5], [5, 5], [-1, -1]]
+    sub_k: [[2, 1], [2, 1], [-1, -1]]
+    last_stage: False
+    use_pool: True
+  Head:
+    name: MultiHead
+    head_list:
+      - CTCHead:
+          Neck:
+            name: svtr
+            dims: 256
+            depth: 2
+            hidden_dims: 256
+            kernel_size: [1, 3]
+            use_guide: True
+          Head:
+            fc_decay: 0.00001
+      - NRTRHead:
+          nrtr_dim: 384
+          max_text_length: *max_text_length # Tự cập nhật
+          num_decoder_layers: 2
+
+Loss:
+  name: MultiLoss
+  loss_config_list:
+    - CTCLoss:
+    - NRTRLoss:
+
+PostProcess:
+  name: CTCLabelDecode
+
+Metric:
+  name: RecMetric
+  main_indicator: acc
+
+Train:
+  dataset:
+    name: MultiScaleDataSet
+    ds_width: false
+    # === PATHS ===
+    data_dir: /kaggle/input/ocr-data/data/train_images/
+    label_file_list:
+    - /kaggle/input/ocr-data/data/train_list.txt
+    # === END PATHS ===
+    ext_op_transform_idx: 1
+    transforms:
+    - DecodeImage:
+        img_mode: BGR
+        channel_first: false
+    - RecAug:
+    - MultiLabelEncode:
+        gtc_encode: NRTRLabelEncode
+    - KeepKeys:
+        keep_keys:
+        - image
+        - label_ctc
+        - label_gtc
+        - length
+        - valid_ratio
+  sampler:
+    name: MultiScaleSampler
+    # === SCALES (W divisible by 8, H by 16) ===
+    # Thêm đa dạng W ở H=48 và một số scale ở H=64 (test height)
+    scales:
+      - [320, 48]
+      - [480, 48]
+      - [640, 48]
+      - [800, 48]
+      - [960, 48]
+      - [480, 64]
+      - [640, 64]
+    # === END SCALES ===
+    # === BATCH SIZE ===
+    first_bs: &bs 32 # Anchor cho batch size mới (32/GPU)
+    # === END BATCH SIZE ===
+    fix_bs: false
+    divided_factor: [8, 16] # W chia hết cho 8, H chia hết cho 16
+    is_training: True
+  loader:
+    shuffle: true
+    batch_size_per_card: *bs # Tham chiếu bs=32
+    drop_last: true
+    num_workers: 2 # Kaggle notebook thường có ít CPU core hơn server, bắt đầu với 2 hoặc 4
+
+Eval:
+  dataset:
+    name: SimpleDataSet
+    # === PATHS ===
+    data_dir: /kaggle/input/ocr-data/data/train_images/ # Ảnh val vẫn lấy từ train_images
+    label_file_list:
+    - /kaggle/input/ocr-data/data/val_list.txt
+    # === END PATHS ===
+    transforms:
+    - DecodeImage:
+        img_mode: BGR
+        channel_first: false
+    - MultiLabelEncode:
+        gtc_encode: NRTRLabelEncode
+    # === EVAL SHAPE (H=48 for validation set) ===
+    - RecResizeImg:
+        image_shape: [3, 48, 960] # Giữ H=48, W phù hợp (ví dụ 960)
+    # === END EVAL SHAPE ===
+    - KeepKeys:
+        keep_keys:
+        - image
+        - label_ctc
+        - label_gtc
+        - length
+        - valid_ratio
+  loader:
+    shuffle: false
+    drop_last: false
+    # === BATCH SIZE ===
+    batch_size_per_card: 32 # Đặt bằng hoặc lớn hơn train bs nếu memory cho phép
+    # === END BATCH SIZE ===
+    num_workers: 2 # Hoặc 4
